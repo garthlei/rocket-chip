@@ -191,6 +191,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val mem_ctrl = Reg(new IntCtrlSigs)
   val wb_ctrl = Reg(new IntCtrlSigs)
 
+  val cfcss_reg_g = RegInit(0.U(16.W))     // TODO Magic number.
+  val cfcss_reg_d = RegInit(0.U(16.W))
+
   val ex_reg_xcpt_interrupt  = Reg(Bool())
   val ex_reg_valid           = Reg(Bool())
   val ex_reg_rvc             = Reg(Bool())
@@ -229,6 +232,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val mem_reg_wdata = Reg(Bits())
   val mem_reg_rs2 = Reg(Bits())
   val mem_br_taken = Reg(Bool())
+  val mem_cfcss_br = Reg(Bool())
   val take_pc_mem = Wire(Bool())
   val mem_reg_wphit          = Reg(Vec(nBreakpoints, Bool()))
 
@@ -388,6 +392,22 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   alu.io.in2 := ex_op2.asUInt
   alu.io.in1 := ex_op1.asUInt
 
+  val cfcss_branch = Wire(Bool());
+
+  when (ex_reg_inst === Instructions.CUSTOM0) {
+    cfcss_reg_g := cfcss_reg_g ^ cfcss_reg_d
+  }.elsewhen (ex_reg_inst === Instructions.CUSTOM0_RS1) {
+    cfcss_reg_g := cfcss_reg_g ^ ex_rs(0)(15, 0)
+  }.elsewhen (ex_reg_inst === Instructions.CUSTOM1_RS1) {
+    cfcss_reg_d := ex_rs(0)(15, 0)
+  }
+
+  when (ex_reg_inst === Instructions.CUSTOM2_RS1) {
+    cfcss_branch := cfcss_reg_g =/= ex_rs(0)(15, 0)
+  }.otherwise {
+    cfcss_branch := false.B
+  }
+
   val ex_scie_unpipelined_wdata = if (!rocketParams.useSCIE) 0.U else {
     val u = Module(new SCIEUnpipelined(xLen))
     u.io.insn := ex_reg_inst
@@ -507,9 +527,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // memory stage
   val mem_pc_valid = mem_reg_valid || mem_reg_replay || mem_reg_xcpt_interrupt
   val mem_br_target = mem_reg_pc.asSInt +
+    Mux(mem_cfcss_br, 0.S,
     Mux(mem_ctrl.branch && mem_br_taken, ImmGen(IMM_SB, mem_reg_inst),
     Mux(mem_ctrl.jal, ImmGen(IMM_UJ, mem_reg_inst),
-    Mux(mem_reg_rvc, SInt(2), SInt(4))))
+    Mux(mem_reg_rvc, SInt(2), SInt(4)))))
   val mem_npc = (Mux(mem_ctrl.jalr || mem_reg_sfence, encodeVirtualAddress(mem_reg_wdata, mem_reg_wdata).asSInt, mem_br_target) & SInt(-2)).asUInt
   val mem_wrong_npc =
     Mux(ex_pc_valid, mem_npc =/= ex_reg_pc,
@@ -551,6 +572,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     mem_reg_pc := ex_reg_pc
     mem_reg_wdata := Mux(ex_scie_unpipelined, ex_scie_unpipelined_wdata, alu.io.out)
     mem_br_taken := alu.io.cmp_out
+    mem_cfcss_br := cfcss_branch
 
     when (ex_ctrl.rxs2 && (ex_ctrl.mem || ex_ctrl.rocc || ex_sfence)) {
       val size = Mux(ex_ctrl.rocc, log2Ceil(xLen/8).U, ex_reg_mem_size)
