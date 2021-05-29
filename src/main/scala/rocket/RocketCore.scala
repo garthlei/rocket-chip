@@ -233,6 +233,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val mem_reg_rs2 = Reg(Bits())
   val mem_br_taken = Reg(Bool())
   val mem_cfcss_br = Reg(Bool())
+  val mem_reg_cfcss_rs1 = Reg(UInt(16.W))
   val take_pc_mem = Wire(Bool())
   val mem_reg_wphit          = Reg(Vec(nBreakpoints, Bool()))
 
@@ -391,22 +392,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   alu.io.fn := ex_ctrl.alu_fn
   alu.io.in2 := ex_op2.asUInt
   alu.io.in1 := ex_op1.asUInt
-
-  val cfcss_branch = Wire(Bool());
-
-  when (ex_reg_inst === Instructions.CUSTOM0) {
-    cfcss_reg_g := cfcss_reg_g ^ cfcss_reg_d
-  }.elsewhen (ex_reg_inst === Instructions.CUSTOM0_RS1) {
-    cfcss_reg_g := cfcss_reg_g ^ ex_rs(0)(15, 0)
-  }.elsewhen (ex_reg_inst === Instructions.CUSTOM1_RS1) {
-    cfcss_reg_d := ex_rs(0)(15, 0)
-  }
-
-  when (ex_reg_inst === Instructions.CUSTOM2_RS1) {
-    cfcss_branch := cfcss_reg_g =/= ex_rs(0)(15, 0)
-  }.otherwise {
-    cfcss_branch := false.B
-  }
 
   val ex_scie_unpipelined_wdata = if (!rocketParams.useSCIE) 0.U else {
     val u = Module(new SCIEUnpipelined(xLen))
@@ -572,7 +557,18 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     mem_reg_pc := ex_reg_pc
     mem_reg_wdata := Mux(ex_scie_unpipelined, ex_scie_unpipelined_wdata, alu.io.out)
     mem_br_taken := alu.io.cmp_out
-    mem_cfcss_br := cfcss_branch
+
+    mem_reg_cfcss_rs1 := ex_rs(0)(15, 0)
+
+    when (ex_reg_inst === Instructions.CUSTOM2_RS1 && mem_reg_inst === Instructions.CUSTOM0) {
+      mem_cfcss_br := cfcss_reg_g ^ cfcss_reg_d =/= ex_rs(0)(15, 0)
+    }.elsewhen (ex_reg_inst === Instructions.CUSTOM2_RS1 && mem_reg_inst === Instructions.CUSTOM0_RS1) {
+      mem_cfcss_br := cfcss_reg_g ^ mem_reg_cfcss_rs1 =/= ex_rs(0)(15, 0)
+    }.elsewhen(ex_reg_inst === Instructions.CUSTOM2_RS1) {
+      mem_cfcss_br := cfcss_reg_g =/= ex_rs(0)(15, 0)
+    }.otherwise {
+      mem_cfcss_br := false.B
+    }
 
     when (ex_ctrl.rxs2 && (ex_ctrl.mem || ex_ctrl.rocc || ex_sfence)) {
       val size = Mux(ex_ctrl.rocc, log2Ceil(xLen/8).U, ex_reg_mem_size)
@@ -629,6 +625,14 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     wb_reg_mem_size := mem_reg_mem_size
     wb_reg_pc := mem_reg_pc
     wb_reg_wphit := mem_reg_wphit | bpu.io.bpwatch.map { bpw => (bpw.rvalid(0) && mem_reg_load) || (bpw.wvalid(0) && mem_reg_store) }
+    
+    when (mem_reg_inst === Instructions.CUSTOM0) {
+      cfcss_reg_g := cfcss_reg_g ^ cfcss_reg_d
+    }.elsewhen (mem_reg_inst === Instructions.CUSTOM0_RS1) {
+      cfcss_reg_g := cfcss_reg_g ^ mem_reg_cfcss_rs1
+    }.elsewhen (mem_reg_inst === Instructions.CUSTOM1_RS1) {
+      cfcss_reg_d := mem_reg_cfcss_rs1
+    }
 
   }
 
