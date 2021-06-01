@@ -625,15 +625,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     wb_reg_mem_size := mem_reg_mem_size
     wb_reg_pc := mem_reg_pc
     wb_reg_wphit := mem_reg_wphit | bpu.io.bpwatch.map { bpw => (bpw.rvalid(0) && mem_reg_load) || (bpw.wvalid(0) && mem_reg_store) }
-    
-    when (mem_reg_inst === Instructions.CUSTOM0) {
-      cfcss_reg_g := cfcss_reg_g ^ cfcss_reg_d
-    }.elsewhen (mem_reg_inst === Instructions.CUSTOM0_RS1) {
-      cfcss_reg_g := cfcss_reg_g ^ mem_reg_cfcss_rs1
-    }.elsewhen (mem_reg_inst === Instructions.CUSTOM1_RS1) {
-      cfcss_reg_d := mem_reg_cfcss_rs1
-    }
-
   }
 
   val (wb_xcpt, wb_cause) = checkExceptions(List(
@@ -664,6 +655,16 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val replay_wb_rocc = wb_reg_valid && wb_ctrl.rocc && !io.rocc.cmd.ready
   val replay_wb = replay_wb_common || replay_wb_rocc
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
+
+  when (mem_pc_valid && !replay_wb) {
+    when (mem_reg_inst === Instructions.CUSTOM0) {
+      cfcss_reg_g := cfcss_reg_g ^ cfcss_reg_d
+    }.elsewhen (mem_reg_inst === Instructions.CUSTOM0_RS1) {
+      cfcss_reg_g := cfcss_reg_g ^ mem_reg_cfcss_rs1
+    }.elsewhen (mem_reg_inst === Instructions.CUSTOM1_RS1) {
+      cfcss_reg_d := mem_reg_cfcss_rs1
+    }
+  }
 
   // writeback arbitration
   val dmem_resp_xpu = !io.dmem.resp.bits.tag(0).asBool
