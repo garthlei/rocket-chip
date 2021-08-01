@@ -193,6 +193,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
   val cfcss_reg_g = RegInit(0.U(16.W))     // TODO Magic number.
   val cfcss_reg_d = RegInit(0.U(16.W))
+  val cfcss_bypass_ex = Wire(UInt(16.W))
 
   val ex_reg_xcpt_interrupt  = Reg(Bool())
   val ex_reg_valid           = Reg(Bool())
@@ -232,10 +233,11 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val mem_reg_wdata = Reg(Bits())
   val mem_reg_rs2 = Reg(Bits())
   val mem_br_taken = Reg(Bool())
-  val mem_cfcss_br = Reg(Bool())
+  // val mem_cfcss_br = Reg(Bool())
   val mem_reg_cfcss_rs1 = Reg(UInt(16.W))
   val take_pc_mem = Wire(Bool())
   val mem_reg_wphit          = Reg(Vec(nBreakpoints, Bool()))
+  val cfcss_g_bypass = Wire(UInt(16.W))
 
   val wb_reg_valid           = Reg(Bool())
   val wb_reg_xcpt            = Reg(Bool())
@@ -298,7 +300,29 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     d.io.insn := id_raw_inst(0)
     d.io
   }
-  val id_illegal_insn = !id_ctrl.legal ||
+
+  val dcache_bypass_data =
+    if (fastLoadByte) io.dmem.resp.bits.data(xLen-1, 0)
+    else if (fastLoadWord) io.dmem.resp.bits.data_word_bypass(xLen-1, 0)
+    else wb_reg_wdata
+
+  val id_cfcss_sig = Mux(id_raddr1 === 0.U, 0.U,
+                     Mux(ex_reg_valid && ex_ctrl.wxd && (ex_reg_inst(11,7)
+                      & regAddrMask) === id_raddr1, cfcss_bypass_ex,
+                     Mux(mem_reg_valid && mem_ctrl.wxd && (mem_reg_inst(11,7)
+                      & regAddrMask) === id_raddr1, mem_reg_wdata(15,0),
+                     Mux(wb_reg_valid && wb_ctrl.wxd && !wb_ctrl.mem
+                      && (wb_reg_inst(11,7) & regAddrMask) === id_raddr1,
+                      wb_reg_wdata(15,0),
+                     Mux(wb_reg_valid && wb_ctrl.wxd && !wb_ctrl.mem
+                      && (wb_reg_inst(11,7) & regAddrMask) === id_raddr1,
+                      dcache_bypass_data,
+                     id_rs(0)(15,0))))))
+
+  val cfcss_illegal =
+    id_inst(0) === Instructions.CUSTOM2_RS1 && cfcss_g_bypass =/= id_cfcss_sig
+
+  val id_illegal_insn = !id_ctrl.legal || cfcss_illegal ||
     (id_ctrl.mul || id_ctrl.div) && !csr.io.status.isa('m'-'a') ||
     id_ctrl.amo && !csr.io.status.isa('a'-'a') ||
     id_ctrl.fp && (csr.io.decode(0).fp_illegal || io.fpu.illegal_rm) ||
@@ -355,11 +379,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   ) else Nil)
   coverExceptions(id_xcpt, id_cause, "DECODE", idCoverCauses)
 
-  val dcache_bypass_data =
-    if (fastLoadByte) io.dmem.resp.bits.data(xLen-1, 0)
-    else if (fastLoadWord) io.dmem.resp.bits.data_word_bypass(xLen-1, 0)
-    else wb_reg_wdata
-
   // detect bypass opportunities
   val ex_waddr = ex_reg_inst(11,7) & regAddrMask
   val mem_waddr = mem_reg_inst(11,7) & regAddrMask
@@ -392,6 +411,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   alu.io.fn := ex_ctrl.alu_fn
   alu.io.in2 := ex_op2.asUInt
   alu.io.in1 := ex_op1.asUInt
+  cfcss_bypass_ex := alu.io.out
 
   val ex_scie_unpipelined_wdata = if (!rocketParams.useSCIE) 0.U else {
     val u = Module(new SCIEUnpipelined(xLen))
@@ -512,10 +532,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // memory stage
   val mem_pc_valid = mem_reg_valid || mem_reg_replay || mem_reg_xcpt_interrupt
   val mem_br_target = mem_reg_pc.asSInt +
-    Mux(mem_cfcss_br, 0.S,
     Mux(mem_ctrl.branch && mem_br_taken, ImmGen(IMM_SB, mem_reg_inst),
     Mux(mem_ctrl.jal, ImmGen(IMM_UJ, mem_reg_inst),
-    Mux(mem_reg_rvc, SInt(2), SInt(4)))))
+    Mux(mem_reg_rvc, SInt(2), SInt(4))))
   val mem_npc = (Mux(mem_ctrl.jalr || mem_reg_sfence, encodeVirtualAddress(mem_reg_wdata, mem_reg_wdata).asSInt, mem_br_target) & SInt(-2)).asUInt
   val mem_wrong_npc =
     Mux(ex_pc_valid, mem_npc =/= ex_reg_pc,
@@ -560,15 +579,15 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
 
     mem_reg_cfcss_rs1 := ex_rs(0)(15, 0)
 
-    when (ex_reg_inst === Instructions.CUSTOM2_RS1 && mem_reg_inst === Instructions.CUSTOM0) {
-      mem_cfcss_br := cfcss_reg_g ^ cfcss_reg_d =/= ex_rs(0)(15, 0)
-    }.elsewhen (ex_reg_inst === Instructions.CUSTOM2_RS1 && mem_reg_inst === Instructions.CUSTOM0_RS1) {
-      mem_cfcss_br := cfcss_reg_g ^ mem_reg_cfcss_rs1 =/= ex_rs(0)(15, 0)
-    }.elsewhen(ex_reg_inst === Instructions.CUSTOM2_RS1) {
-      mem_cfcss_br := cfcss_reg_g =/= ex_rs(0)(15, 0)
-    }.otherwise {
-      mem_cfcss_br := false.B
-    }
+    // when (ex_reg_inst === Instructions.CUSTOM2_RS1 && mem_reg_inst === Instructions.CUSTOM0) {
+    //   mem_cfcss_br := cfcss_reg_g ^ cfcss_reg_d =/= ex_rs(0)(15, 0)
+    // }.elsewhen (ex_reg_inst === Instructions.CUSTOM2_RS1 && mem_reg_inst === Instructions.CUSTOM0_RS1) {
+    //   mem_cfcss_br := cfcss_reg_g ^ mem_reg_cfcss_rs1 =/= ex_rs(0)(15, 0)
+    // }.elsewhen(ex_reg_inst === Instructions.CUSTOM2_RS1) {
+    //   mem_cfcss_br := cfcss_reg_g =/= ex_rs(0)(15, 0)
+    // }.otherwise {
+    //   mem_cfcss_br := false.B
+    // }
 
     when (ex_ctrl.rxs2 && (ex_ctrl.mem || ex_ctrl.rocc || ex_sfence)) {
       val size = Mux(ex_ctrl.rocc, log2Ceil(xLen/8).U, ex_reg_mem_size)
@@ -656,13 +675,41 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val replay_wb = replay_wb_common || replay_wb_rocc
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
 
-  when (mem_pc_valid && !replay_wb) {
+  when (mem_pc_valid && !mem_xcpt && !replay_wb) {
     when (mem_reg_inst === Instructions.CUSTOM0) {
       cfcss_reg_g := cfcss_reg_g ^ cfcss_reg_d
     }.elsewhen (mem_reg_inst === Instructions.CUSTOM0_RS1) {
       cfcss_reg_g := cfcss_reg_g ^ mem_reg_cfcss_rs1
     }.elsewhen (mem_reg_inst === Instructions.CUSTOM1_RS1) {
       cfcss_reg_d := mem_reg_cfcss_rs1
+    }
+  }
+
+  when (ex_reg_valid && ex_reg_inst === Instructions.CUSTOM0) {
+    when (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0) {
+      cfcss_g_bypass := cfcss_reg_g
+    }.elsewhen (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0_RS1) {
+      cfcss_g_bypass := cfcss_reg_g ^ mem_reg_cfcss_rs1 ^ cfcss_reg_d
+    }.elsewhen (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM1_RS1) {
+      cfcss_g_bypass := cfcss_reg_g ^ mem_reg_cfcss_rs1
+    }.otherwise {
+      cfcss_g_bypass := cfcss_reg_g ^ cfcss_reg_d
+    }
+  }.elsewhen (ex_reg_valid && ex_reg_inst === Instructions.CUSTOM0_RS1) {
+    when (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0) {
+      cfcss_g_bypass := cfcss_reg_g ^ cfcss_reg_d ^ ex_rs(0)(15, 0)
+    }.elsewhen (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0_RS1) {
+      cfcss_g_bypass := cfcss_reg_g ^ mem_reg_cfcss_rs1 ^ ex_rs(0)(15, 0)
+    }.otherwise {
+      cfcss_g_bypass := cfcss_reg_g ^ ex_rs(0)(15, 0)
+    }
+  }.otherwise {
+    when (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0) {
+      cfcss_g_bypass := cfcss_reg_g ^ cfcss_reg_d
+    }.elsewhen (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0_RS1) {
+      cfcss_g_bypass := cfcss_reg_g ^ mem_reg_cfcss_rs1
+    }.otherwise {
+      cfcss_g_bypass := cfcss_reg_g
     }
   }
 
