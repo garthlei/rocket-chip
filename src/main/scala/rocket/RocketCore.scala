@@ -191,9 +191,8 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val mem_ctrl = Reg(new IntCtrlSigs)
   val wb_ctrl = Reg(new IntCtrlSigs)
 
-  val cfcss_reg_g = RegInit(0.U(16.W))     // TODO Magic number.
-  val cfcss_reg_d = RegInit(0.U(16.W))
-  val cfcss_bypass_ex = Wire(UInt(16.W))
+  val cfcss_reg_g = RegInit(0.U(8.W))     // TODO Magic number.
+  val cfcss_reg_d = RegInit(0.U(8.W))
 
   val ex_reg_xcpt_interrupt  = Reg(Bool())
   val ex_reg_valid           = Reg(Bool())
@@ -211,6 +210,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val ex_scie_unpipelined = Reg(Bool())
   val ex_scie_pipelined = Reg(Bool())
   val ex_reg_wphit            = Reg(Vec(nBreakpoints, Bool()))
+  val ex_reg_cfcss_g          = RegInit(0.U(8.W))
+  val ex_reg_cfcss_d          = RegInit(0.U(8.W))
+
 
   val mem_reg_xcpt_interrupt  = Reg(Bool())
   val mem_reg_valid           = Reg(Bool())
@@ -233,11 +235,10 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val mem_reg_wdata = Reg(Bits())
   val mem_reg_rs2 = Reg(Bits())
   val mem_br_taken = Reg(Bool())
-  // val mem_cfcss_br = Reg(Bool())
-  val mem_reg_cfcss_rs1 = Reg(UInt(16.W))
   val take_pc_mem = Wire(Bool())
   val mem_reg_wphit          = Reg(Vec(nBreakpoints, Bool()))
-  val cfcss_g_bypass = Wire(UInt(16.W))
+  val cfcss_g_bypass = Wire(UInt(8.W))
+  val cfcss_d_bypass = Wire(UInt(8.W))
 
   val wb_reg_valid           = Reg(Bool())
   val wb_reg_xcpt            = Reg(Bool())
@@ -306,21 +307,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     else if (fastLoadWord) io.dmem.resp.bits.data_word_bypass(xLen-1, 0)
     else wb_reg_wdata
 
-  val id_cfcss_sig = Mux(id_raddr1 === 0.U, 0.U,
-                     Mux(ex_reg_valid && ex_ctrl.wxd && (ex_reg_inst(11,7)
-                      & regAddrMask) === id_raddr1, cfcss_bypass_ex,
-                     Mux(mem_reg_valid && mem_ctrl.wxd && (mem_reg_inst(11,7)
-                      & regAddrMask) === id_raddr1, mem_reg_wdata(15,0),
-                     Mux(wb_reg_valid && wb_ctrl.wxd && !wb_ctrl.mem
-                      && (wb_reg_inst(11,7) & regAddrMask) === id_raddr1,
-                      wb_reg_wdata(15,0),
-                     Mux(wb_reg_valid && wb_ctrl.wxd && !wb_ctrl.mem
-                      && (wb_reg_inst(11,7) & regAddrMask) === id_raddr1,
-                      dcache_bypass_data,
-                     id_rs(0)(15,0))))))
-
   val cfcss_illegal =
-    id_inst(0) === Instructions.CUSTOM2_RS1 && cfcss_g_bypass =/= id_cfcss_sig
+    id_inst(0) === Instructions.CTRLSIG_S && (cfcss_g_bypass ^ id_inst(0)(31,24)) =/= id_inst(0)(23,16) ||
+    id_inst(0) === Instructions.CTRLSIG_M && (cfcss_g_bypass ^ id_inst(0)(31,24) ^ cfcss_d_bypass) =/= id_inst(0)(23,16)
 
   val id_illegal_insn = !id_ctrl.legal || cfcss_illegal ||
     (id_ctrl.mul || id_ctrl.div) && !csr.io.status.isa('m'-'a') ||
@@ -411,7 +400,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   alu.io.fn := ex_ctrl.alu_fn
   alu.io.in2 := ex_op2.asUInt
   alu.io.in1 := ex_op1.asUInt
-  cfcss_bypass_ex := alu.io.out
 
   val ex_scie_unpipelined_wdata = if (!rocketParams.useSCIE) 0.U else {
     val u = Module(new SCIEUnpipelined(xLen))
@@ -577,18 +565,6 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
     mem_reg_wdata := Mux(ex_scie_unpipelined, ex_scie_unpipelined_wdata, alu.io.out)
     mem_br_taken := alu.io.cmp_out
 
-    mem_reg_cfcss_rs1 := ex_rs(0)(15, 0)
-
-    // when (ex_reg_inst === Instructions.CUSTOM2_RS1 && mem_reg_inst === Instructions.CUSTOM0) {
-    //   mem_cfcss_br := cfcss_reg_g ^ cfcss_reg_d =/= ex_rs(0)(15, 0)
-    // }.elsewhen (ex_reg_inst === Instructions.CUSTOM2_RS1 && mem_reg_inst === Instructions.CUSTOM0_RS1) {
-    //   mem_cfcss_br := cfcss_reg_g ^ mem_reg_cfcss_rs1 =/= ex_rs(0)(15, 0)
-    // }.elsewhen(ex_reg_inst === Instructions.CUSTOM2_RS1) {
-    //   mem_cfcss_br := cfcss_reg_g =/= ex_rs(0)(15, 0)
-    // }.otherwise {
-    //   mem_cfcss_br := false.B
-    // }
-
     when (ex_ctrl.rxs2 && (ex_ctrl.mem || ex_ctrl.rocc || ex_sfence)) {
       val size = Mux(ex_ctrl.rocc, log2Ceil(xLen/8).U, ex_reg_mem_size)
       mem_reg_rs2 := new StoreGen(size, 0.U, ex_rs(1), coreDataBytes).data
@@ -675,42 +651,21 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val replay_wb = replay_wb_common || replay_wb_rocc
   take_pc_wb := replay_wb || wb_xcpt || csr.io.eret || wb_reg_flush_pipe
 
-  when (mem_pc_valid && !mem_xcpt && !replay_wb) {
-    when (mem_reg_inst === Instructions.CUSTOM0) {
-      cfcss_reg_g := cfcss_reg_g ^ cfcss_reg_d
-    }.elsewhen (mem_reg_inst === Instructions.CUSTOM0_RS1) {
-      cfcss_reg_g := cfcss_reg_g ^ mem_reg_cfcss_rs1
-    }.elsewhen (mem_reg_inst === Instructions.CUSTOM1_RS1) {
-      cfcss_reg_d := mem_reg_cfcss_rs1
-    }
+  when (mem_pc_valid && !mem_xcpt && !replay_wb
+        && (mem_reg_inst === Instructions.CTRLSIG_S || mem_reg_inst === Instructions.CTRLSIG_M)) {
+    cfcss_reg_g := mem_reg_inst(23,16)
+    cfcss_reg_d := mem_reg_inst(15,8)
   }
 
-  when (ex_reg_valid && ex_reg_inst === Instructions.CUSTOM0) {
-    when (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0) {
-      cfcss_g_bypass := cfcss_reg_g
-    }.elsewhen (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0_RS1) {
-      cfcss_g_bypass := cfcss_reg_g ^ mem_reg_cfcss_rs1 ^ cfcss_reg_d
-    }.elsewhen (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM1_RS1) {
-      cfcss_g_bypass := cfcss_reg_g ^ mem_reg_cfcss_rs1
-    }.otherwise {
-      cfcss_g_bypass := cfcss_reg_g ^ cfcss_reg_d
-    }
-  }.elsewhen (ex_reg_valid && ex_reg_inst === Instructions.CUSTOM0_RS1) {
-    when (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0) {
-      cfcss_g_bypass := cfcss_reg_g ^ cfcss_reg_d ^ ex_rs(0)(15, 0)
-    }.elsewhen (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0_RS1) {
-      cfcss_g_bypass := cfcss_reg_g ^ mem_reg_cfcss_rs1 ^ ex_rs(0)(15, 0)
-    }.otherwise {
-      cfcss_g_bypass := cfcss_reg_g ^ ex_rs(0)(15, 0)
-    }
+  when (ex_reg_valid && (ex_reg_inst === Instructions.CTRLSIG_S || ex_reg_inst === Instructions.CTRLSIG_M)) {
+    cfcss_g_bypass := ex_reg_inst(23,16)
+    cfcss_d_bypass := ex_reg_inst(15,8)
+  }.elsewhen (mem_reg_valid && (mem_reg_inst === Instructions.CTRLSIG_S || mem_reg_inst === Instructions.CTRLSIG_M)) {
+    cfcss_g_bypass := mem_reg_inst(23,16)
+    cfcss_d_bypass := mem_reg_inst(15,8)
   }.otherwise {
-    when (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0) {
-      cfcss_g_bypass := cfcss_reg_g ^ cfcss_reg_d
-    }.elsewhen (mem_reg_valid && mem_reg_inst === Instructions.CUSTOM0_RS1) {
-      cfcss_g_bypass := cfcss_reg_g ^ mem_reg_cfcss_rs1
-    }.otherwise {
-      cfcss_g_bypass := cfcss_reg_g
-    }
+    cfcss_g_bypass := cfcss_reg_g
+    cfcss_d_bypass := cfcss_reg_d
   }
 
   // writeback arbitration
