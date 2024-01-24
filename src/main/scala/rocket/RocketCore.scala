@@ -31,8 +31,9 @@ case class RocketCoreParams(
   mcontextWidth: Int = 0,
   scontextWidth: Int = 0,
   nPMPs: Int = 8,
-  nPerfCounters: Int = 0,
+  nPerfCounters: Int = 3,
   haveBasicCounters: Boolean = true,
+  override val useSscofpmf: Boolean = true,
   haveCFlush: Boolean = false,
   misaWritable: Boolean = true,
   nL2TLBEntries: Int = 0,
@@ -131,7 +132,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   // performance counters
   def pipelineIDToWB[T <: Data](x: T): T =
     RegEnable(RegEnable(RegEnable(x, !ctrl_killd), ex_pc_valid), mem_pc_valid)
-  val perfEvents = new EventSets(Seq(
+  val perfEvents = new ScalarEventSets(Seq(
     new EventSet((mask, hits) => Mux(wb_xcpt, mask(0), wb_valid && pipelineIDToWB((mask & hits).orR)), Seq(
       ("exception", () => false.B),
       ("load", () => id_ctrl.mem && id_ctrl.mem_cmd === M_XRD && !id_ctrl.fp),
@@ -173,7 +174,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       ("D$ release", () => io.dmem.perf.release),
       ("ITLB miss", () => io.imem.perf.tlbMiss),
       ("DTLB miss", () => io.dmem.perf.tlbMiss),
-      ("L2 TLB miss", () => io.ptw.perf.l2miss)))))
+      ("L2 TLB miss", () => io.ptw.perf.l2miss))),
+    new EventSet((mask, hits) => (mask & hits).orR, Seq(
+      ("inst count", () => wb_valid)))))
 
   val pipelinedMul = usingMulDiv && mulDivParams.mulUnroll == xLen
   val decode_table = {

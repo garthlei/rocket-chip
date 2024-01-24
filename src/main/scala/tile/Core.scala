@@ -24,6 +24,7 @@ trait CoreParams {
   val useCompressed: Boolean
   val useVector: Boolean = false
   val vectorUseDCache: Boolean = false
+  val useSscofpmf: Boolean = false
   val useRVE: Boolean
   val useConditionalZero: Boolean
   val mulDiv: Option[MulDivParams]

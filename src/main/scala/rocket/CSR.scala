@@ -124,6 +124,17 @@ class MIP(implicit p: Parameters) extends CoreBundle()(p)
   val usip = Bool()
 }
 
+class MHPMEvents extends Bundle {
+  val of = Bool()
+  val minh = Bool()
+  val sinh = Bool()
+  val uinh = Bool()
+  val vsinh = Bool()
+  val vuinh = Bool()
+  val zero2 = UInt(2.W)
+  val sel = UInt(56.W)
+}
+
 class Envcfg extends Bundle {
   val stce = Bool() // only for menvcfg/henvcfg
   val pbmte = Bool() // only for menvcfg/henvcfg
@@ -216,7 +227,7 @@ object CSR
 
 class PerfCounterIO(implicit p: Parameters) extends CoreBundle
     with HasCoreParameters {
-  val eventSel = Output(UInt(xLen.W))
+  val eventSel = Output(UInt(if (usingSscofpmf) 56.W else xLen.W))
   val inc = Input(UInt(log2Ceil(1+retireWidth).W))
 }
 
@@ -373,7 +384,7 @@ class VType(implicit p: Parameters) extends CoreBundle {
 }
 
 class CSRFile(
-  perfEventSets: EventSets = new EventSets(Seq()),
+  perfEventSets: EventSets = new ScalarEventSets(Seq()),
   customCSRs: Seq[CustomCSR] = Nil,
   roccCSRs: Seq[CustomCSR] = Nil)(implicit p: Parameters)
     extends CoreModule()(p)
@@ -414,7 +425,7 @@ class CSRFile(
     sup.vseip := usingHypervisor.B
     sup.meip := true.B
     sup.sgeip := false.B
-    sup.rocc := usingRoCC.B
+    sup.rocc := (usingRoCC || usingSscofpmf).B
     sup.debug := false.B
     sup.zero1 := false.B
     sup.lip foreach { _ := true.B }
@@ -583,10 +594,27 @@ class CSRFile(
   val reg_instret = WideCounter(64, io.retire, inhibit = reg_mcountinhibit(2))
   val reg_cycle = if (enableCommitLog) WideCounter(64, io.retire,     inhibit = reg_mcountinhibit(0))
     else withClock(io.ungated_clock) { WideCounter(64, !io.csr_stall, inhibit = reg_mcountinhibit(0)) }
-  val reg_hpmevent = io.counters.map(c => RegInit(0.U(xLen.W)))
-    (io.counters zip reg_hpmevent) foreach { case (c, e) => c.eventSel := e }
-  val reg_hpmcounter = io.counters.zipWithIndex.map { case (c, i) =>
-    WideCounter(CSR.hpmWidth, c.inc, reset = false, inhibit = reg_mcountinhibit(CSR.firstHPM+i)) }
+  
+  val reg_hpmevent = io.counters.map(c => RegInit(0.U.asTypeOf(new MHPMEvents)))
+    (io.counters zip reg_hpmevent) foreach { case (c, e) => c.eventSel := e.sel }
+  val counter_inhibit = reg_hpmevent.zipWithIndex.map { case (e, i) =>
+    reg_mcountinhibit(CSR.firstHPM+i) ||
+    e.minh && reg_mstatus.prv === PRV.M.U ||
+    e.sinh && !reg_mstatus.v && reg_mstatus.prv === PRV.S.U ||
+    e.uinh && !reg_mstatus.v && reg_mstatus.prv === PRV.U.U ||
+    e.vsinh && reg_mstatus.v && reg_mstatus.prv === PRV.S.U ||
+    e.vuinh && reg_mstatus.v && reg_mstatus.prv === PRV.U.U }
+  val reg_hpmcounter = (io.counters zip counter_inhibit).map { case (c, i) =>
+    WideCounter(CSR.hpmWidth, c.inc, reset = false, inhibit = i) }
+
+  val counter_overflow =
+    if (usingSscofpmf)
+      (reg_hpmevent zip reg_hpmcounter).map { case (e, c) =>
+        !e.of && c.carryOut(CSR.hpmWidth - 1) === 1.U }
+    else Seq.fill(nPerfCounters)(false.B)
+
+  if (usingSscofpmf)
+    (reg_hpmevent zip counter_overflow) foreach { case (e, o) => e.of := e.of || o }
 
   val mip = WireDefault(reg_mip)
   mip.lip := (io.interrupts.lip: Seq[Bool])
@@ -597,7 +625,7 @@ class CSRFile(
   io.interrupts.seip.foreach { mip.seip := reg_mip.seip || _ }
   // Simimlar sort of thing would apply if the PLIC had a VSEIP line:
   //io.interrupts.vseip.foreach { mip.vseip := reg_mip.vseip || _ }
-  mip.rocc := io.rocc_interrupt
+  mip.rocc :=  (if (usingSscofpmf) counter_overflow.foldLeft(false.B)(_ || _) else io.rocc_interrupt)
   val read_mip = mip.asUInt & supported_interrupts
   val read_hip = read_mip & hs_delegable_interrupts
   val high_interrupts = (if (usingNMI) 0.U else io.interrupts.buserror.map(_ << CSR.busErrorIntCause).getOrElse(0.U))
@@ -706,7 +734,7 @@ class CSRFile(
 
     for (((e, c), i) <- (reg_hpmevent.padTo(CSR.nHPM, 0.U)
                          zip reg_hpmcounter.map(x => x: UInt).padTo(CSR.nHPM, 0.U)).zipWithIndex) {
-      read_mapping += (i + CSR.firstHPE) -> e // mhpmeventN
+      read_mapping += (i + CSR.firstHPE) -> e.asUInt // mhpmeventN
       read_mapping += (i + CSR.firstMHPC) -> c // mhpmcounterN
       read_mapping += (i + CSR.firstHPC) -> c // hpmcounterN
       if (xLen == 32) {
@@ -1287,7 +1315,18 @@ class CSRFile(
 
     for (((e, c), i) <- (reg_hpmevent zip reg_hpmcounter).zipWithIndex) {
       writeCounter(i + CSR.firstMHPC, c, wdata)
-      when (decoded_addr(i + CSR.firstHPE)) { e := perfEventSets.maskEventSelector(wdata) }
+      when (decoded_addr(i + CSR.firstHPE)) {
+        val new_hpe = wdata.asTypeOf(new MHPMEvents)
+        if (usingSscofpmf) {
+          e.of := new_hpe.of
+          e.minh := new_hpe.minh
+          e.sinh := new_hpe.sinh
+          e.uinh := new_hpe.uinh
+          e.vsinh := new_hpe.vsinh
+          e.vuinh := new_hpe.vuinh
+        }
+        e.sel := perfEventSets.maskEventSelector(new_hpe.sel)
+      }
     }
     if (coreParams.haveBasicCounters) {
       when (decoded_addr(CSRs.mcountinhibit)) { reg_mcountinhibit := wdata & ~2.U(xLen.W) }  // mcountinhibit bit [1] is tied zero

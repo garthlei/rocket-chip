@@ -51,6 +51,9 @@ trait HasNonDiplomaticTileParameters {
   def usingBTB: Boolean = tileParams.btb.isDefined && tileParams.btb.get.nEntries > 0
   def usingPTW: Boolean = usingVM
   def usingDataScratchpad: Boolean = tileParams.dcache.flatMap(_.scratch).isDefined
+  def usingSscofpmf: Boolean = tileParams.core.useSscofpmf
+  
+  require(!usingSscofpmf || !usingRoCC, "RoCC and Sscofpmf cannot be used simultaenously")
 
   def xLen: Int = p(XLen)
   def xBytes: Int = xLen / 8
