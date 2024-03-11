@@ -609,8 +609,8 @@ class CSRFile(
 
   val counter_overflow =
     if (usingSscofpmf)
-      (reg_hpmevent zip reg_hpmcounter).map { case (e, c) =>
-        !e.of && c.carryOut(CSR.hpmWidth - 1) === 1.U }
+      (reg_hpmevent zip (counter_inhibit zip reg_hpmcounter)).map { case (e, (i, c)) =>
+        !e.of && !i && c.carryOut(CSR.hpmWidth - 1) === 1.U }
     else Seq.fill(nPerfCounters)(false.B)
 
   if (usingSscofpmf)
@@ -625,7 +625,10 @@ class CSRFile(
   io.interrupts.seip.foreach { mip.seip := reg_mip.seip || _ }
   // Simimlar sort of thing would apply if the PLIC had a VSEIP line:
   //io.interrupts.vseip.foreach { mip.vseip := reg_mip.vseip || _ }
-  mip.rocc :=  (if (usingSscofpmf) counter_overflow.foldLeft(false.B)(_ || _) else io.rocc_interrupt)
+  if (usingSscofpmf)
+    when (counter_overflow.foldLeft(false.B)(_ || _)) { reg_mip.rocc := true.B }
+  else
+    mip.rocc := io.rocc_interrupt
   val read_mip = mip.asUInt & supported_interrupts
   val read_hip = read_mip & hs_delegable_interrupts
   val high_interrupts = (if (usingNMI) 0.U else io.interrupts.buserror.map(_ << CSR.busErrorIntCause).getOrElse(0.U))
@@ -794,6 +797,8 @@ class CSRFile(
     read_mapping += CSRs.sepc -> readEPC(reg_sepc).sextTo(xLen)
     read_mapping += CSRs.stvec -> read_stvec
     read_mapping += CSRs.scounteren -> read_scounteren
+    if (usingSscofpmf)
+      read_mapping += CSRs.scountovf -> (reg_hpmevent.padTo(CSR.nHPM, 0.U.asTypeOf(new MHPMEvents)).map(_.of).asUInt << CSR.firstHPM)
     read_mapping += CSRs.mideleg -> read_mideleg
     read_mapping += CSRs.medeleg -> read_medeleg
     read_mapping += CSRs.senvcfg -> reg_senvcfg.asUInt
@@ -1292,6 +1297,9 @@ class CSRFile(
       if (usingHypervisor) {
         reg_mip.vssip := new_mip.vssip
       }
+      if (usingSscofpmf) {
+        reg_mip.rocc := new_mip.rocc
+      }
     }
     when (decoded_addr(CSRs.mie))      { reg_mie := wdata & supported_interrupts }
     when (decoded_addr(CSRs.mepc))     { reg_mepc := formEPC(wdata) }
@@ -1375,6 +1383,7 @@ class CSRFile(
       when (decoded_addr(CSRs.sip)) {
         val new_sip = ((read_mip & ~read_mideleg) | (wdata & read_mideleg)).asTypeOf(new MIP())
         reg_mip.ssip := new_sip.ssip
+        if (usingSscofpmf) reg_mip.rocc := new_sip.rocc
       }
       when (decoded_addr(CSRs.satp)) {
         if (usingVM) {
@@ -1651,9 +1660,11 @@ class CSRFile(
   }
 
   def chooseInterrupt(masksIn: Seq[UInt]): (Bool, UInt) = {
-    val nonstandard = supported_interrupts.getWidth-1 to 12 by -1
-    // MEI, MSI, MTI,  SEI, SSI, STI, VSEI, VSSI, VSTI, UEI, USI, UTI
-    val standard = Seq(11, 3, 7, 9, 1, 5, 10, 2, 6, 8, 0, 4)
+    val nonstandard = if (usingSscofpmf)
+        (supported_interrupts.getWidth-1 to 14 by -1) :+ 12
+      else supported_interrupts.getWidth-1 to 12 by -1
+    // MEI, MSI, MTI,  SEI, SSI, STI, VSEI, VSSI, VSTI, UEI, USI, UTI, LCOFI
+    val standard = Seq(11, 3, 7, 9, 1, 5, 10, 2, 6, 8, 0, 4) ++ (if (usingSscofpmf) Seq(13) else Nil)
     val priority = nonstandard ++ standard
     val masks = masksIn.reverse
     val any = masks.flatMap(m => priority.filter(_ < m.getWidth).map(i => m(i))).reduce(_||_)
