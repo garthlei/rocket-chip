@@ -31,7 +31,7 @@ case class RocketCoreParams(
   mcontextWidth: Int = 0,
   scontextWidth: Int = 0,
   nPMPs: Int = 8,
-  nPerfCounters: Int = 3,
+  nPerfCounters: Int = 12,
   haveBasicCounters: Boolean = true,
   override val useSscofpmf: Boolean = true,
   haveCFlush: Boolean = false,
@@ -176,7 +176,9 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
       ("DTLB miss", () => io.dmem.perf.tlbMiss),
       ("L2 TLB miss", () => io.ptw.perf.l2miss))),
     new EventSet((mask, hits) => (mask & hits).orR, Seq(
-      ("inst count", () => wb_valid)))))
+      ("inst count", () => wb_valid))),
+    new EventSet((mask, hits) => (mask & hits).orR, Seq(
+      ("clock cycles ", () => !csr.io.csr_stall)))))
 
   val pipelinedMul = usingMulDiv && mulDivParams.mulUnroll == xLen
   val decode_table = {
@@ -294,7 +296,7 @@ class Rocket(tile: RocketTile)(implicit p: Parameters) extends CoreModule()(p)
   val ctrl_killd = Wire(Bool())
   val id_npc = (ibuf.io.pc.asSInt + ImmGen(IMM_UJ, id_inst(0))).asUInt
 
-  val csr = Module(new CSRFile(perfEvents, coreParams.customCSRs.decls, tile.roccCSRs.flatten))
+  val csr: CSRFile = Module(new CSRFile(perfEvents, coreParams.customCSRs.decls, tile.roccCSRs.flatten))
   val id_csr_en = id_ctrl.csr.isOneOf(CSR.S, CSR.C, CSR.W)
   val id_system_insn = id_ctrl.csr === CSR.I
   val id_csr_ren = id_ctrl.csr.isOneOf(CSR.S, CSR.C) && id_expanded_inst(0).rs1 === 0.U
